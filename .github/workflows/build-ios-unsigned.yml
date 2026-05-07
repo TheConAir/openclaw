@@ -1,0 +1,398 @@
+name: Build OpenClaw iOS-only unsigned IPA
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: "Repo to build"
+        default: "openclaw/openclaw"
+        required: true
+        type: string
+
+      openclaw_ref:
+        description: "OpenClaw version/ref to build"
+        default: "v2026.5.6"
+        required: true
+        type: choice
+        options:
+          - v2026.5.6
+          - v2026.5.5
+          - v2026.5.4
+          - v2026.5.3-1
+          - v2026.5.3
+          - main
+          - custom
+
+      custom_ref:
+        description: "Only used when OpenClaw ref is custom. Example: v2026.5.3, main, or a commit SHA"
+        default: ""
+        required: false
+        type: string
+
+      project_dir:
+        description: "Folder containing the Xcode project"
+        default: "apps/ios"
+        required: true
+        type: string
+
+      project_file:
+        description: ".xcodeproj or .xcworkspace file"
+        default: "OpenClaw.xcodeproj"
+        required: true
+        type: string
+
+      scheme:
+        description: "Xcode scheme to build"
+        default: "OpenClaw"
+        required: true
+        type: string
+
+      configuration:
+        description: "Build configuration"
+        default: "Debug"
+        required: true
+        type: choice
+        options:
+          - Debug
+          - Release
+
+      app_name:
+        description: "Name of the built .app"
+        default: "OpenClaw"
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build iOS-only unsigned IPA
+    runs-on: macos-26
+
+    steps:
+      - name: Resolve OpenClaw ref
+        id: resolve-ref
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.openclaw_ref }}" = "custom" ]; then
+            if [ -z "${{ inputs.custom_ref }}" ]; then
+              echo "You selected custom but did not enter custom_ref."
+              exit 1
+            fi
+
+            echo "ref=${{ inputs.custom_ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ inputs.openclaw_ref }}" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Resolved OpenClaw ref:"
+          cat "$GITHUB_OUTPUT"
+
+      - name: Checkout OpenClaw source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ steps.resolve-ref.outputs.ref }}
+          submodules: recursive
+
+      - name: Show checked out version
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Repository:"
+          git remote -v
+
+          echo "Current ref:"
+          git branch --show-current || true
+          git rev-parse HEAD
+          git describe --tags --always || true
+
+          echo "Top-level files:"
+          ls -la
+
+      - name: Select newest available Xcode
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Installed Xcodes:"
+          ls -la /Applications | grep Xcode || true
+
+          if [ -d "/Applications/Xcode_26.2.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
+          elif [ -d "/Applications/Xcode_26.1.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_26.1.app/Contents/Developer
+          elif [ -d "/Applications/Xcode_26.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_26.app/Contents/Developer
+          else
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          fi
+
+          xcodebuild -version
+          swift --version
+
+      - name: Install dependencies and generate iOS-only Xcode project
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          corepack enable
+          pnpm install --frozen-lockfile
+
+          brew install xcodegen || true
+
+          mkdir -p apps/ios/Config
+
+          cat > apps/ios/Signing.xcconfig <<'EOF'
+          OPENCLAW_CODE_SIGN_STYLE = Manual
+          OPENCLAW_DEVELOPMENT_TEAM =
+          OPENCLAW_APP_BUNDLE_ID = com.connor.openclaw
+          OPENCLAW_SHARE_BUNDLE_ID = com.connor.openclaw.share
+          OPENCLAW_ACTIVITY_WIDGET_BUNDLE_ID = com.connor.openclaw.activitywidget
+          OPENCLAW_WATCH_APP_BUNDLE_ID = com.connor.openclaw.watchkitapp
+          OPENCLAW_WATCH_EXTENSION_BUNDLE_ID = com.connor.openclaw.watchkitapp.extension
+          OPENCLAW_APP_PROFILE =
+          OPENCLAW_SHARE_PROFILE =
+          OPENCLAW_WATCH_APP_PROFILE =
+          OPENCLAW_WATCH_EXTENSION_PROFILE =
+          OPENCLAW_MARKETING_VERSION = 0.0.0
+          OPENCLAW_IOS_VERSION = 0.0.0
+          OPENCLAW_BUILD_VERSION = ${{ github.run_number }}
+          EOF
+
+          cp apps/ios/Signing.xcconfig apps/ios/Config/Signing.xcconfig
+
+          echo "Patching project.yml to remove Watch app from iOS build dependency graph"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("apps/ios/project.yml")
+          text = path.read_text()
+
+          text = re.sub(
+              r"\n\s*-\s*target:\s*OpenClawWatchApp\s*\n",
+              "\n",
+              text,
+          )
+
+          path.write_text(text)
+          PY
+
+          echo "Patching project.yml to remove SwiftFormat/SwiftLint pre-build scripts"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("apps/ios/project.yml")
+          lines = path.read_text().splitlines()
+
+          out = []
+          skip = False
+
+          for line in lines:
+              stripped = line.lstrip()
+              indent = len(line) - len(stripped)
+
+              if not skip and indent == 4 and stripped == "preBuildScripts:":
+                  skip = True
+                  continue
+
+              if skip:
+                  if line.strip() and indent <= 4:
+                      skip = False
+                      out.append(line)
+                  continue
+
+              out.append(line)
+
+          path.write_text("\n".join(out) + "\n")
+          PY
+
+          echo "Patching GatewayOnboardingView.swift to import OpenClawKit"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("apps/ios/Sources/Onboarding/GatewayOnboardingView.swift")
+
+          if not path.exists():
+              print("GatewayOnboardingView.swift not found, skipping patch")
+              raise SystemExit(0)
+
+          text = path.read_text()
+
+          if "import OpenClawKit" not in text:
+              if "import SwiftUI\n" in text:
+                  text = text.replace(
+                      "import SwiftUI\n",
+                      "import SwiftUI\nimport OpenClawKit\n",
+                      1,
+                  )
+              elif "import SwiftUI" in text:
+                  text = text.replace(
+                      "import SwiftUI",
+                      "import SwiftUI\nimport OpenClawKit",
+                      1,
+                  )
+              else:
+                  text = "import OpenClawKit\n" + text
+
+          path.write_text(text)
+          PY
+
+          echo "Patched project.yml watch/lint references:"
+          grep -nE "OpenClawWatchApp|OpenClawWatchExtension|SwiftFormat|SwiftLint|preBuildScripts" apps/ios/project.yml || true
+
+          echo "Patched GatewayOnboarding imports:"
+          sed -n '1,20p' apps/ios/Sources/Onboarding/GatewayOnboardingView.swift || true
+
+          cd apps/ios
+          xcodegen generate
+
+          echo "Generated files:"
+          ls -la
+
+          echo "Available schemes:"
+          xcodebuild -list -project OpenClaw.xcodeproj
+
+      - name: Build iOS app without code signing
+        id: build-ios
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          cd "${{ inputs.project_dir }}"
+
+          if [[ "${{ inputs.project_file }}" == *.xcworkspace ]]; then
+            container_arg=(-workspace "${{ inputs.project_file }}")
+          else
+            container_arg=(-project "${{ inputs.project_file }}")
+          fi
+
+          mkdir -p build/logs
+
+          set +e
+
+          xcodebuild \
+            "${container_arg[@]}" \
+            -scheme "${{ inputs.scheme }}" \
+            -configuration "${{ inputs.configuration }}" \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build 2>&1 | tee build/logs/xcodebuild.log
+
+          status=${PIPESTATUS[0]}
+
+          echo ""
+          echo "========== Xcode error summary =========="
+          grep -nEi "error:|fatal error:|BUILD FAILED|The following build commands failed|CodeSign|Signing|Provisioning|watchkit|watchapp|swiftformat|swiftlint|No such module|cannot find|type-check|Command PhaseScriptExecution failed" build/logs/xcodebuild.log || true
+          echo "========================================="
+          echo ""
+
+          echo "Build products:"
+          find build/DerivedData/Build/Products -maxdepth 8 -type d | sort || true
+
+          APP_PATH=$(find build/DerivedData/Build/Products \
+            -name "${{ inputs.app_name }}.app" \
+            -type d \
+            | head -n 1)
+
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+
+          if [ "$status" -ne 0 ]; then
+            echo "xcodebuild exited with status $status"
+
+            if [ -n "$APP_PATH" ] && [ -d "$APP_PATH" ]; then
+              echo "Found app bundle despite xcodebuild failure:"
+              echo "$APP_PATH"
+
+              if [ -f "$APP_PATH/${{ inputs.app_name }}" ]; then
+                echo "Found app executable too. Continuing to package artifact anyway."
+                echo "partial_build=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+
+              echo "App bundle exists, but executable was not found:"
+              find "$APP_PATH" -maxdepth 2 -type f | sort || true
+            fi
+
+            exit "$status"
+          fi
+
+          echo "partial_build=false" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Xcode build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log-${{ steps.resolve-ref.outputs.ref }}-${{ inputs.configuration }}
+          path: ${{ inputs.project_dir }}/build/logs/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "${{ inputs.project_dir }}"
+
+          echo "Searching for app bundles:"
+          find build/DerivedData/Build/Products -name "*.app" -type d -print
+
+          APP_PATH=$(find build/DerivedData/Build/Products \
+            -name "${{ inputs.app_name }}.app" \
+            -type d \
+            | head -n 1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "Could not find ${{ inputs.app_name }}.app"
+            echo "All app bundles found:"
+            find build/DerivedData/Build/Products -name "*.app" -type d -print
+            exit 1
+          fi
+
+          if [ ! -f "$APP_PATH/${{ inputs.app_name }}" ]; then
+            echo "Found app bundle, but app executable is missing:"
+            echo "$APP_PATH/${{ inputs.app_name }}"
+            find "$APP_PATH" -maxdepth 3 -type f | sort || true
+            exit 1
+          fi
+
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+
+          cp -R "$APP_PATH" "build/ipa/Payload/${{ inputs.app_name }}.app"
+
+          echo "Checking final Payload contents:"
+          find build/ipa/Payload -maxdepth 5 -type d | sort
+
+          echo "Confirming no Watch app was embedded:"
+          if find "build/ipa/Payload/${{ inputs.app_name }}.app" -maxdepth 6 -type d | grep -i Watch; then
+            echo "Watch app was still embedded. Failing because this is supposed to be iOS-only."
+            exit 1
+          fi
+
+          cd build/ipa
+          zip -qry "${{ inputs.app_name }}-${{ steps.resolve-ref.outputs.ref }}-${{ inputs.configuration }}-ios-only-unsigned.ipa" Payload
+
+          echo "Created IPA:"
+          ls -lh "${{ inputs.app_name }}-${{ steps.resolve-ref.outputs.ref }}-${{ inputs.configuration }}-ios-only-unsigned.ipa"
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_name }}-${{ steps.resolve-ref.outputs.ref }}-${{ inputs.configuration }}-ios-only-unsigned-ipa
+          path: ${{ inputs.project_dir }}/build/ipa/${{ inputs.app_name }}-${{ steps.resolve-ref.outputs.ref }}-${{ inputs.configuration }}-ios-only-unsigned.ipa
+          if-no-files-found: error
