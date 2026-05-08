@@ -18,6 +18,7 @@ on:
         required: true
         type: choice
         options:
+          - v2026.5.7
           - v2026.5.6
           - v2026.5.5
           - v2026.5.4
@@ -27,7 +28,7 @@ on:
           - custom
 
       custom_ref:
-        description: "Only used when OpenClaw ref is custom. Example: v2026.5.3, main, or a commit SHA"
+        description: "Only used when OpenClaw ref is custom. Example: v2026.5.6, main, or a commit SHA"
         default: ""
         required: false
         type: string
@@ -74,22 +75,29 @@ jobs:
       - name: Resolve OpenClaw ref
         id: resolve-ref
         shell: bash
+        env:
+          SELECTED_REF: ${{ inputs.openclaw_ref }}
+          CUSTOM_REF: ${{ inputs.custom_ref }}
         run: |
           set -euo pipefail
 
-          if [ "${{ inputs.openclaw_ref }}" = "custom" ]; then
-            if [ -z "${{ inputs.custom_ref }}" ]; then
+          if [ "$SELECTED_REF" = "custom" ]; then
+            if [ -z "$CUSTOM_REF" ]; then
               echo "You selected custom but did not enter custom_ref."
               exit 1
             fi
-
-            echo "ref=${{ inputs.custom_ref }}" >> "$GITHUB_OUTPUT"
+            REF="$CUSTOM_REF"
           else
-            echo "ref=${{ inputs.openclaw_ref }}" >> "$GITHUB_OUTPUT"
+            REF="$SELECTED_REF"
           fi
 
-          echo "Resolved OpenClaw ref:"
-          cat "$GITHUB_OUTPUT"
+          SAFE_REF="$(printf '%s' "$REF" | sed 's#[/:]#-#g' | tr -cd 'A-Za-z0-9._-')"
+
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "safe_ref=$SAFE_REF" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved OpenClaw ref: $REF"
+          echo "Safe artifact ref: $SAFE_REF"
 
       - name: Checkout OpenClaw source
         uses: actions/checkout@v4
@@ -106,10 +114,14 @@ jobs:
           echo "Repository:"
           git remote -v
 
-          echo "Current ref:"
+          echo "Current branch/ref:"
           git branch --show-current || true
+
+          echo "Commit:"
           git rev-parse HEAD
-          git describe --tags --always || true
+
+          echo "Describe:"
+          git describe --tags --exact-match || git describe --tags --always || true
 
           echo "Top-level files:"
           ls -la
@@ -135,15 +147,22 @@ jobs:
           xcodebuild -version
           swift --version
 
-      - name: Install dependencies and generate iOS-only Xcode project
+      - name: Install dependencies and generate patched iOS-only Xcode project
         shell: bash
         run: |
           set -euxo pipefail
 
           corepack enable
-          pnpm install --frozen-lockfile
 
-          brew install xcodegen || true
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --frozen-lockfile
+          else
+            pnpm install
+          fi
+
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
 
           mkdir -p apps/ios/Config
 
@@ -173,6 +192,11 @@ jobs:
           import re
 
           path = Path("apps/ios/project.yml")
+
+          if not path.exists():
+              print("apps/ios/project.yml not found")
+              raise SystemExit(1)
+
           text = path.read_text()
 
           text = re.sub(
@@ -190,6 +214,11 @@ jobs:
           from pathlib import Path
 
           path = Path("apps/ios/project.yml")
+
+          if not path.exists():
+              print("apps/ios/project.yml not found")
+              raise SystemExit(1)
+
           lines = path.read_text().splitlines()
 
           out = []
@@ -214,43 +243,86 @@ jobs:
           path.write_text("\n".join(out) + "\n")
           PY
 
-          echo "Patching GatewayOnboardingView.swift to import OpenClawKit"
+          echo "Stubbing problematic SwiftUI screens for unsigned CI build"
 
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("apps/ios/Sources/Onboarding/GatewayOnboardingView.swift")
+          gateway_path = Path("apps/ios/Sources/Onboarding/GatewayOnboardingView.swift")
+          settings_path = Path("apps/ios/Sources/Settings/SettingsTab.swift")
 
-          if not path.exists():
-              print("GatewayOnboardingView.swift not found, skipping patch")
-              raise SystemExit(0)
+          if not gateway_path.exists():
+              print("GatewayOnboardingView.swift not found")
+              raise SystemExit(1)
 
-          text = path.read_text()
+          if not settings_path.exists():
+              print("SettingsTab.swift not found")
+              raise SystemExit(1)
 
-          if "import OpenClawKit" not in text:
-              if "import SwiftUI\n" in text:
-                  text = text.replace(
-                      "import SwiftUI\n",
-                      "import SwiftUI\nimport OpenClawKit\n",
-                      1,
-                  )
-              elif "import SwiftUI" in text:
-                  text = text.replace(
-                      "import SwiftUI",
-                      "import SwiftUI\nimport OpenClawKit",
-                      1,
-                  )
-              else:
-                  text = "import OpenClawKit\n" + text
+          gateway_path.write_text(
+              '''import SwiftUI
 
-          path.write_text(text)
+struct GatewayOnboardingView: View {
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                Image(systemName: "network")
+                    .font(.system(size: 44))
+
+                Text("Gateway onboarding unavailable")
+                    .font(.headline)
+
+                Text("This screen was stubbed for the unsigned iOS-only CI build.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding()
+            .navigationTitle("Connect Gateway")
+        }
+    }
+}
+'''
+          )
+
+          settings_path.write_text(
+              '''import SwiftUI
+
+struct SettingsTab: View {
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Settings") {
+                    Text("Settings were stubbed for the unsigned iOS-only CI build.")
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Build") {
+                    Text("OpenClaw unsigned iOS-only artifact")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Settings")
+        }
+    }
+}
+'''
+          )
           PY
+
+          echo "Verifying stubs were applied"
+
+          grep -q "Gateway onboarding unavailable" apps/ios/Sources/Onboarding/GatewayOnboardingView.swift
+          grep -q "Settings were stubbed" apps/ios/Sources/Settings/SettingsTab.swift
 
           echo "Patched project.yml watch/lint references:"
           grep -nE "OpenClawWatchApp|OpenClawWatchExtension|SwiftFormat|SwiftLint|preBuildScripts" apps/ios/project.yml || true
 
-          echo "Patched GatewayOnboarding imports:"
-          sed -n '1,20p' apps/ios/Sources/Onboarding/GatewayOnboardingView.swift || true
+          echo "Patched GatewayOnboardingView.swift:"
+          sed -n '1,100p' apps/ios/Sources/Onboarding/GatewayOnboardingView.swift
+
+          echo "Patched SettingsTab.swift:"
+          sed -n '1,100p' apps/ios/Sources/Settings/SettingsTab.swift
 
           cd apps/ios
           xcodegen generate
@@ -325,7 +397,7 @@ jobs:
               fi
 
               echo "App bundle exists, but executable was not found:"
-              find "$APP_PATH" -maxdepth 2 -type f | sort || true
+              find "$APP_PATH" -maxdepth 3 -type f | sort || true
             fi
 
             exit "$status"
@@ -337,7 +409,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcodebuild-log-${{ steps.resolve-ref.outputs.ref }}-${{ inputs.configuration }}
+          name: xcodebuild-log-${{ steps.resolve-ref.outputs.safe_ref }}-${{ inputs.configuration }}
           path: ${{ inputs.project_dir }}/build/logs/xcodebuild.log
           if-no-files-found: ignore
 
@@ -385,14 +457,17 @@ jobs:
           fi
 
           cd build/ipa
-          zip -qry "${{ inputs.app_name }}-${{ steps.resolve-ref.outputs.ref }}-${{ inputs.configuration }}-ios-only-unsigned.ipa" Payload
+
+          IPA_NAME="${{ inputs.app_name }}-${{ steps.resolve-ref.outputs.safe_ref }}-${{ inputs.configuration }}-ios-only-unsigned.ipa"
+
+          zip -qry "$IPA_NAME" Payload
 
           echo "Created IPA:"
-          ls -lh "${{ inputs.app_name }}-${{ steps.resolve-ref.outputs.ref }}-${{ inputs.configuration }}-ios-only-unsigned.ipa"
+          ls -lh "$IPA_NAME"
 
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.app_name }}-${{ steps.resolve-ref.outputs.ref }}-${{ inputs.configuration }}-ios-only-unsigned-ipa
-          path: ${{ inputs.project_dir }}/build/ipa/${{ inputs.app_name }}-${{ steps.resolve-ref.outputs.ref }}-${{ inputs.configuration }}-ios-only-unsigned.ipa
+          name: ${{ inputs.app_name }}-${{ steps.resolve-ref.outputs.safe_ref }}-${{ inputs.configuration }}-ios-only-unsigned-ipa
+          path: ${{ inputs.project_dir }}/build/ipa/${{ inputs.app_name }}-${{ steps.resolve-ref.outputs.safe_ref }}-${{ inputs.configuration }}-ios-only-unsigned.ipa
           if-no-files-found: error
