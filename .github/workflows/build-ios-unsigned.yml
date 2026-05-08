@@ -369,7 +369,7 @@ struct SettingsTab: View {
 
           echo ""
           echo "========== Xcode error summary =========="
-          grep -nEi "error:|fatal error:|BUILD FAILED|The following build commands failed|CodeSign|Signing|Provisioning|watchkit|watchapp|swiftformat|swiftlint|No such module|cannot find|type-check|Command PhaseScriptExecution failed" build/logs/xcodebuild.log || true
+          grep -nEi "error:|fatal error:|BUILD FAILED|The following build commands failed|CodeSign|Signing|Provisioning|watchkit|watchapp|swiftformat|swiftlint|No such module|cannot find|type-check" build/logs/xcodebuild.log || true
           echo "========================================="
           echo ""
 
